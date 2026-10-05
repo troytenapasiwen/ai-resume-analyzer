@@ -430,6 +430,30 @@ def _select_project_entries(entries, query_words):
     return [best_entry] if best_score != (0, 0, 0) else []
 
 
+def _project_reference_terms(words):
+    for position in range(len(words) - 1, -1, -1):
+        if words[position] not in {"in", "within", "for", "on"}:
+            continue
+        terms = [
+            word for word in words[position + 1:]
+            if word not in SEARCH_STOPWORDS
+            and word not in QUERY_META_WORDS
+            and word not in {"project", "projects"}
+        ]
+        if terms:
+            return terms
+    return []
+
+
+def _contains_ordered_terms(text, terms):
+    text_tokens = _normalize_tokens(text)
+    size = len(terms)
+    return bool(size) and any(
+        text_tokens[start:start + size] == terms
+        for start in range(len(text_tokens) - size + 1)
+    )
+
+
 def _original_tokens(query, tokens):
     """Tokens of `query` in their ORIGINAL casing, aligned 1:1 with
     `tokens` (the lowercase output of _tokenize). Used only to display an
@@ -526,43 +550,31 @@ def _extract_resume_skill_sections(resume_text):
             "development_tools": [],
         }
 
-    categories = {
-        "programming_languages": [
-            "programming languages",
-            "programming language",
-            "languages",
-        ],
-        "frameworks_and_technologies": [
-            "frameworks and technologies",
-            "frameworks",
-            "technologies",
-            "technology stack",
-            "tools and technologies",
-            "stack",
-        ],
-        "development_tools": [
-            "development tools",
-            "development tool",
-            "tools",
-            "tooling",
-        ],
+    result = {
+        "programming_languages": [],
+        "frameworks_and_technologies": [],
+        "development_tools": [],
     }
 
-    result = {name: [] for name in categories}
+    def category_for_label(label):
+        normalized = re.sub(r"[^a-z0-9]+", " ", label.lower()).strip()
+        if "programming" in normalized or normalized in {"language", "languages"}:
+            return "programming_languages"
+        if "technolog" in normalized or "framework" in normalized or "stack" in normalized:
+            return "frameworks_and_technologies"
+        if "tool" in normalized or "tooling" in normalized:
+            return "development_tools"
+        return "frameworks_and_technologies"
 
     for raw_line in resume_text.splitlines():
         line = raw_line.strip()
         if not line:
             continue
-        lowered = line.lower()
-        for category, labels in categories.items():
-            for label in labels:
-                if not lowered.startswith(label):
-                    continue
-                remainder = line[len(label):].lstrip(" :;-")
-                if remainder:
-                    result[category].extend(_split_generic_skill_items(remainder))
-                break
+        label, separator, remainder = line.partition(":")
+        if not separator or not label.strip() or not remainder.strip():
+            continue
+        category = category_for_label(label)
+        result[category].extend(_split_generic_skill_items(remainder.strip()))
 
     return result
 
@@ -1249,6 +1261,11 @@ def search_resume(query, resume_text=None):
     text = _resolve_resume_text(resume_text)
     lines = extract_lines(text)
     line_index = {line: position for position, line in enumerate(lines)}
+    favorite_language = (
+        _extract_explicit_favorite_language(text)
+        if _is_favorite_language_query(query)
+        else None
+    )
 
     tokens = _tokenize(query)
     words = [_normalize(token) for token in tokens]
@@ -1430,6 +1447,24 @@ def search_resume(query, resume_text=None):
             lines=lines,
         )
 
+    structured_project_blocks = {
+        entry.get("raw_text")
+        for entry in structured.get("projects") or []
+        if isinstance(entry, dict) and entry.get("raw_text")
+    }
+    project_reference = _project_reference_terms(words)
+    named_project_blocks = [
+        block for block in structured_project_blocks
+        if _contains_ordered_terms(block, project_reference)
+    ]
+    named_project_technology_query = (
+        bool(project_reference)
+        and "skills" in matched_concepts
+        and any(token in {"use", "used", "using"} for token in tokens)
+    )
+    if named_project_technology_query:
+        project_technology_query = True
+
     specific = [name for name in matched_concepts if not CONCEPTS[name]["generic"]]
     generic = [name for name in matched_concepts if CONCEPTS[name]["generic"]]
 
@@ -1558,7 +1593,13 @@ def search_resume(query, resume_text=None):
             structured = get_structured_resume(text)
             section_entries = structured.get(struct_key, [])
             if project_technology_query and name == "project":
-                section_entries = _select_project_entries(section_entries, words)
+                if named_project_technology_query:
+                    section_entries = [
+                        entry for entry in section_entries
+                        if isinstance(entry, dict) and entry.get("raw_text") in named_project_blocks
+                    ]
+                else:
+                    section_entries = _select_project_entries(section_entries, words)
             structured_blocks = [
                 entry["raw_text"] for entry in section_entries if entry["raw_text"]
             ]
@@ -1639,11 +1680,27 @@ def search_resume(query, resume_text=None):
     }
 
     for block in entity_blocks:
+        if named_project_technology_query and block not in named_project_blocks:
+            continue
         _add_fact(employer_summary_by_block.get(block), TIER_ENTITY_MATCH)
         _add_fact(block, TIER_ENTITY_MATCH)
 
     for line in literal_facts:
+        if named_project_technology_query and not any(
+            line in block for block in named_project_blocks
+        ):
+            continue
         _add_fact(line, TIER_LITERAL)
+
+    if favorite_language:
+        _add_fact(
+            f"Favorite programming language: {favorite_language}",
+            TIER_STRUCTURED,
+        )
+        not_found_terms = [
+            term for term in not_found_terms
+            if _normalize(term) not in {"favorite", "favourite"}
+        ]
 
     # Sort by (tier, original document position). Document position is only
     # a tie-breaker within a tier now, so a structured raw_text block
@@ -2246,6 +2303,13 @@ def analyze_history(messages, resume_text=None):
         (message["content"] for message in messages if message["role"] == "user"),
         "",
     )
+    resolved_resume = _resolve_resume_text(resume_text) if resume_text else ""
+    favorite_language = _extract_explicit_favorite_language(resolved_resume)
+    favorite_language_requested = _is_favorite_language_query(question)
+    programming_languages = (
+        get_candidate_skills(resolved_resume)["programming_languages"]
+        if resolved_resume else []
+    )
     contextual_answer_tokens = set()
     if (
         _query_matches_concept(question, "education")
@@ -2313,10 +2377,20 @@ def analyze_history(messages, resume_text=None):
     ):
         contextual_answer_tokens.clear()
 
+    project_relationship = _requested_project_technology_relationship(
+        question,
+        evidence_groups,
+    )
+
     return {
+        "question": question,
         "facts": all_facts,
         "evidence_groups": evidence_groups,
         "contextual_answer_tokens": contextual_answer_tokens,
+        "favorite_language": favorite_language,
+        "favorite_language_not_explicit": favorite_language_requested and not favorite_language,
+        "programming_languages": programming_languages,
+        "requested_project_relationship": project_relationship,
         "gap_terms": gap_terms,
         "has_evidence": bool(all_facts),
         "has_gap": has_gap,
@@ -2584,6 +2658,12 @@ def ask_llm_for_decision(state, correction=""):
 # ============================================================
 
 def answer_has_unsupported_positive_claims(answer, analysis):
+    if (
+        analysis.get("favorite_language_not_explicit")
+        and _answer_claims_favorite_language(answer)
+    ):
+        return True
+
     evidence_tokens = _coverage_tokens(" ".join(analysis["facts"]))
     ignored_tokens = (
         SEARCH_STOPWORDS
@@ -2643,6 +2723,148 @@ _USAGE_AT_ENTITY_PATTERNS = [
     ),
 ]
 
+_PROJECT_USAGE_PATTERNS = [
+    re.compile(
+        r"\b(?:use|uses|used|using)\s+(?P<object>.+?)\s+(?:in|within|for|on)\s+(?P<project>[^,.;!?]+)",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"\b(?P<object>.+?)\s+(?:is|was|were|has been|had been)\s+used\s+(?:in|within|for|on)\s+(?P<project>[^,.;!?]+)",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"\b(?P<project>(?:the\s+)?(?:[A-Za-z0-9+#.-]+\s+){0,4}project)\s+(?:use|uses|used|build|built|implement|implemented)\s+(?P<object>[^,.;!?]+)",
+        re.IGNORECASE,
+    ),
+]
+
+_PROJECT_RELATION_QUERY_PATTERNS = [
+    re.compile(
+        r"\b(?:was|is|were)\s+(?P<object>.+?)\s+(?:used|applied|implemented)\s+"
+        r"(?:in|within|for|on)\s+(?P<project>[^,.;!?]+)",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"\b(?:did|does|do)\s+(?:the\s+)?(?:candidate|applicant|they|you|i)\s+"
+        r"(?:use|apply|implement)\s+(?P<object>.+?)\s+(?:in|within|for|on)\s+"
+        r"(?P<project>[^,.;!?]+)",
+        re.IGNORECASE,
+    ),
+]
+
+_FAVORITE_LANGUAGE_QUERY_PATTERN = re.compile(
+    r"\b(?:favorite|favourite)\b.{0,50}\b(?:programming\s+)?languages?\b|"
+    r"\blanguages?\b.{0,50}\b(?:favorite|favourite)\b",
+    re.IGNORECASE,
+)
+_FAVORITE_LANGUAGE_VALUE_PATTERNS = [
+    re.compile(
+        r"\b(?:favorite|favourite)\s+(?:programming\s+)?language\s*(?:is|:|=)\s*"
+        r"(?P<language>[^\r\n,.;]+)",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"\b(?P<language>[A-Za-z][A-Za-z0-9_+#.-]*)\s+is\s+(?:the\s+)?"
+        r"(?:candidate's|candidate|their|his|her|my)?\s*favorite\s+"
+        r"(?:programming\s+)?language\b",
+        re.IGNORECASE,
+    ),
+]
+_FAVORITE_LANGUAGE_ABSENCE_PATTERN = re.compile(
+    r"\b(?:no evidence|does not state|doesn't state|does not specify|doesn't specify|"
+    r"not stated|not specified|not provided|cannot confirm|can't confirm|unknown)\b"
+    r".{0,100}\b(?:favorite|favourite)\b|"
+    r"\b(?:favorite|favourite)\b.{0,100}\b(?:not stated|not specified|not provided|unknown)\b",
+    re.IGNORECASE,
+)
+_FAVORITE_LANGUAGE_CLAIM_PATTERN = re.compile(
+    r"\b(?:favorite|favourite)\s+(?:programming\s+)?language\s*(?:is|was|:)\s*"
+    r"(?P<language>[A-Za-z][A-Za-z0-9_+#.-]*)|"
+    r"\b(?P<reverse>[A-Za-z][A-Za-z0-9_+#.-]*)\s+is\s+(?:the\s+)?"
+    r"(?:candidate's|candidate|their|his|her|my)?\s*favorite\s+"
+    r"(?:programming\s+)?language\b",
+    re.IGNORECASE,
+)
+
+
+def _is_favorite_language_query(question):
+    return bool(_FAVORITE_LANGUAGE_QUERY_PATTERN.search(question))
+
+
+def _extract_explicit_favorite_language(resume_text):
+    for pattern in _FAVORITE_LANGUAGE_VALUE_PATTERNS:
+        match = pattern.search(resume_text or "")
+        if not match:
+            continue
+        value = match.group("language").strip(" \t:-=")
+        if value and not re.match(r"^(?:not|no|unknown|unspecified)\b", value, re.IGNORECASE):
+            return value
+    return None
+
+
+def _favorite_language_is_explicitly_denied(answer):
+    return any(
+        _FAVORITE_LANGUAGE_ABSENCE_PATTERN.search(clause)
+        for clause in re.split(r"(?<=[.!?;])\s+|\b(?:but|however|although)\b", answer, flags=re.IGNORECASE)
+    )
+
+
+def _answer_claims_favorite_language(answer):
+    return any(
+        _FAVORITE_LANGUAGE_CLAIM_PATTERN.search(clause)
+        and not _FAVORITE_LANGUAGE_ABSENCE_PATTERN.search(clause)
+        for clause in re.split(r"(?<=[.!?;])\s+|\b(?:but|however|although)\b", answer, flags=re.IGNORECASE)
+    )
+
+
+def _requested_project_technology_relationship(question, evidence_groups):
+    match = next(
+        (candidate for pattern in _PROJECT_RELATION_QUERY_PATTERNS
+         if (candidate := pattern.search(question))),
+        None,
+    )
+    if not match:
+        return None
+
+    technology = match.group("object").strip()
+    project = match.group("project").strip(" \t\r\n")
+    technology_tokens = _coverage_tokens(technology) - QUERY_META_WORDS
+    project_tokens = _coverage_tokens(project) - {"project", "projects"}
+    project_groups = [
+        group for group in evidence_groups
+        if group.get("section") == "projects"
+        and project_tokens
+        and project_tokens <= _coverage_tokens(group.get("context", ""))
+    ]
+    supported = bool(technology_tokens) and any(
+        technology_tokens <= _coverage_tokens(" ".join(
+            source.get("text", "") for source in group.get("evidence", [])
+        ))
+        for group in project_groups
+    )
+    return {
+        "technology": technology,
+        "project": project,
+        "supported": supported,
+    }
+
+
+def _answer_explicitly_disclaims_project_relationship(answer):
+    patterns = (
+        re.compile(r"\b(?:does not|doesn't) establish\b.{0,100}\b(?:used|use|relationship)\b", re.IGNORECASE),
+        re.compile(r"\bno evidence\b.{0,100}\b(?:used|use|relationship)\b", re.IGNORECASE),
+        re.compile(r"\b(?:not established|not supported|cannot verify|can't verify|cannot confirm|can't confirm)\b", re.IGNORECASE),
+        re.compile(r"\bmentions?\b.{0,100}\bseparately\b", re.IGNORECASE),
+    )
+    return any(pattern.search(answer) for pattern in patterns)
+
+_NEGATED_PROJECT_USAGE_PATTERN = re.compile(
+    r"\b(?:no evidence(?: that)?|not|never|does not|doesn't|is not|isn't|was not|wasn't|"
+    r"cannot|can't|could not|couldn't|unable to|does not establish|doesn't establish)\b"
+    r".{0,100}$",
+    re.IGNORECASE,
+)
+
 
 def answer_has_unsupported_relationship_claims(answer, analysis):
     evidence_groups = analysis.get("evidence_groups", [])
@@ -2665,6 +2887,20 @@ def answer_has_unsupported_relationship_claims(answer, analysis):
             for group in groups
         )
 
+    project_groups = [
+        group for group in evidence_groups
+        if group.get("section") == "projects"
+    ]
+
+    def project_groups_named_by(project_phrase):
+        project_tokens = _coverage_tokens(project_phrase) - {"project", "projects"}
+        if not project_tokens:
+            return []
+        return [
+            group for group in project_groups
+            if project_tokens <= _coverage_tokens(group.get("context", ""))
+        ]
+
     for sentence in re.split(r"(?<=[.!?])\s+", answer):
         if any(pattern.search(sentence) for pattern in DENIAL_PATTERNS):
             continue
@@ -2677,6 +2913,31 @@ def answer_has_unsupported_relationship_claims(answer, analysis):
                     continue
                 matching_entries = groups_containing_entity(entity_tokens)
                 if not matching_entries or not object_is_in_entry(object_tokens, matching_entries):
+                    return True
+
+        for pattern in _PROJECT_USAGE_PATTERNS:
+            for match in pattern.finditer(sentence):
+                relation_prefix = re.split(
+                    r"[.;,]|\b(?:but|however|although|whereas)\b",
+                    sentence[:match.start()],
+                    flags=re.IGNORECASE,
+                )[-1]
+                if _NEGATED_PROJECT_USAGE_PATTERN.search(relation_prefix):
+                    continue
+                object_tokens = _coverage_tokens(match.group("object"))
+                project_phrase = match.group("project")
+                matching_projects = project_groups_named_by(project_phrase)
+                explicit_project_reference = bool(
+                    {"project", "projects", "capstone"}
+                    & set(_coverage_tokens(project_phrase))
+                )
+                if not matching_projects and not explicit_project_reference:
+                    continue
+                if (
+                    not object_tokens
+                    or not matching_projects
+                    or not object_is_in_entry(object_tokens, matching_projects)
+                ):
                     return True
 
         answer_tokens = _normalize_tokens(sentence)
@@ -3043,6 +3304,24 @@ def build_correction_text(analysis, refers_to_history=False, contradicts=True,
 
 
 def build_fallback_answer(analysis, question=""):
+    project_relationship = analysis.get("requested_project_relationship")
+    if project_relationship and not project_relationship["supported"]:
+        technology = project_relationship["technology"]
+        project = project_relationship["project"]
+        return (
+            f"The resume does not establish that {technology} was used in {project}."
+        )
+
+    if analysis.get("favorite_language_not_explicit"):
+        languages = analysis.get("programming_languages", [])
+        if languages:
+            listed = ", ".join(languages)
+            return (
+                "The resume does not state the candidate's favorite programming language. "
+                f"It lists {listed} as programming languages."
+            )
+        return "The resume does not state the candidate's favorite programming language."
+
     parts = []
 
     if analysis["facts"]:
@@ -3062,7 +3341,7 @@ def build_fallback_answer(analysis, question=""):
 
 
 def build_safe_stop_answer(state, reason):
-    analysis = analyze_history(state.messages)
+    analysis = analyze_history(state.messages, state.resume_text)
 
     if not analysis["any_tool_ran"]:
         return f"{reason} No resume evidence was collected, so no grounded answer can be given."
@@ -3097,7 +3376,29 @@ def ground_final_answer(state, answer):
     analysis = analyze_history(state.messages, state.resume_text)
 
     question = current_question(state)
-    contradicts = answer_contradicts_evidence(answer, analysis)
+    project_relationship = analysis.get("requested_project_relationship")
+    project_refusal_required = bool(
+        project_relationship and not project_relationship["supported"]
+    )
+    favorite_refusal_required = bool(analysis.get("favorite_language_not_explicit"))
+
+    def satisfies_explicit_refusals(candidate):
+        if (
+            project_refusal_required
+            and not _answer_explicitly_disclaims_project_relation(candidate)
+        ):
+            return False
+        if favorite_refusal_required and (
+            not _favorite_language_is_explicitly_denied(candidate)
+            or _answer_claims_favorite_language(candidate)
+        ):
+            return False
+        return True
+
+    contradicts = (
+        answer_contradicts_evidence(answer, analysis)
+        or not satisfies_explicit_refusals(answer)
+    )
     refers_to_history = answer_refers_to_history(answer, question)
     incomplete = answer_is_incomplete(answer)
 
@@ -3110,6 +3411,7 @@ def ground_final_answer(state, answer):
         completed_answer = complete_answer_with_relevant_evidence(answer, state)
         if (
             not answer_contradicts_evidence(completed_answer, analysis)
+            and satisfies_explicit_refusals(completed_answer)
             and not answer_refers_to_history(completed_answer, question)
             and not answer_is_incomplete(completed_answer)
             and not (check_over_denial and answer_over_denies_employment(completed_answer, analysis))
@@ -3127,21 +3429,33 @@ def ground_final_answer(state, answer):
     else:
         print("GROUNDING CHECK: the answer contradicts the tool results. Asking the LLM once more.")
 
-    retry = ask_llm_for_decision(
-        state,
-        correction=build_correction_text(
-            analysis,
-            refers_to_history=refers_to_history,
-            contradicts=contradicts,
-            incomplete=incomplete,
-            over_denies=over_denies,
-        ),
+    correction = build_correction_text(
+        analysis,
+        refers_to_history=refers_to_history,
+        contradicts=contradicts,
+        incomplete=incomplete,
+        over_denies=over_denies,
     )
+    if project_refusal_required:
+        correction += (
+            " The parsed project evidence does not contain the requested technology. "
+            "Clearly state that the resume does not establish that relationship; do not "
+            "answer with a list of separate mentions or imply the technology was used there."
+        )
+    if favorite_refusal_required:
+        correction += (
+            " The resume contains no explicit favorite-language statement. You may state "
+            "the programming languages it lists, but clearly say it does not state which "
+            "one is the candidate's favorite. Do not infer a favorite."
+        )
+
+    retry = ask_llm_for_decision(state, correction=correction)
 
     if retry["action"] == "final":
         completed_retry = complete_answer_with_relevant_evidence(retry["answer"], state)
         if (
             not answer_contradicts_evidence(completed_retry, analysis)
+            and satisfies_explicit_refusals(completed_retry)
             and not answer_refers_to_history(completed_retry, question)
             and not answer_is_incomplete(completed_retry)
             and not (check_over_denial and answer_over_denies_employment(completed_retry, analysis))

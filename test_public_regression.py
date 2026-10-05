@@ -11,6 +11,7 @@ from agent_loop import (
     AgentState,
     analyze_history,
     authoritative_employer_result,
+    get_candidate_skills,
     answer_contradicts_evidence,
     answer_has_unsupported_positive_claims,
     answer_has_unsupported_relationship_claims,
@@ -78,6 +79,35 @@ Built an internal system unrelated to the capstone.
 SKILLS
 GlobalOnlyFramework
 Python
+"""
+
+GENERIC_SKILL_LABEL_RESUME = """Casey Morgan
+SKILLS
+Programming: LanguageAlpha, LanguageBeta
+Frameworks: FrameworkAlpha (PluginAlpha, PluginBeta)
+Databases: StoreAlpha
+Tools: ToolAlpha
+Languages: LanguageGamma
+Cloud Platforms: PlatformAlpha
+"""
+
+PROJECT_RELATIONSHIP_RESUME = """Casey Morgan
+PROJECT EXPERIENCE
+CAPSTONE PROJECT
+Example Delivery Platform
+Built the platform using CapstoneOnlyFramework.
+
+OTHER PROJECT
+Example Inventory Tool
+Built the inventory tool using OtherProjectOnlyFramework.
+
+EXPERIENCE
+Example Corporation
+Software Intern
+Used ExperienceOnlyFramework in internal applications.
+
+SKILLS
+Frameworks: GlobalOnlyFramework
 """
 
 
@@ -228,7 +258,7 @@ class GroundingRegressionTests(unittest.TestCase):
         self.assertNotIn(unsupported_answer, fallback)
         self.assertIn("Built internal APIs using Python and PostgreSQL", fallback)
         self.assertIn("React", fallback)
-        self.assertIn("does not establish the requested relationship", fallback)
+        self.assertIn("does not establish", fallback.lower())
 
 
 class EducationGroundingTests(unittest.TestCase):
@@ -385,6 +415,211 @@ class ProjectTechnologyScopingTests(unittest.TestCase):
         )
 
         self.assertIn("GlobalOnlyFramework", "\n".join(result["results"]))
+
+
+class GenericSkillsLabelTests(unittest.TestCase):
+    def test_arbitrary_skill_labels_are_parsed_without_technology_vocabulary(self):
+        skills = get_candidate_skills(GENERIC_SKILL_LABEL_RESUME)
+
+        self.assertEqual(
+            skills["programming_languages"],
+            ["LanguageAlpha", "LanguageBeta", "LanguageGamma"],
+        )
+        self.assertIn("FrameworkAlpha (PluginAlpha, PluginBeta)", skills["frameworks_and_technologies"])
+        self.assertIn("StoreAlpha", skills["frameworks_and_technologies"])
+        self.assertIn("PlatformAlpha", skills["frameworks_and_technologies"])
+        self.assertEqual(skills["development_tools"], ["ToolAlpha"])
+
+    def test_labeled_database_is_retrieved_and_general_skills_remain_available(self):
+        database_result = search_resume(
+            "What database is listed in the candidate's skills?",
+            GENERIC_SKILL_LABEL_RESUME,
+        )
+        general_result = search_resume(
+            "What technologies does the candidate know?",
+            GENERIC_SKILL_LABEL_RESUME,
+        )
+
+        self.assertIn("StoreAlpha", "\n".join(database_result["results"]))
+        self.assertIn("PlatformAlpha", "\n".join(general_result["results"]))
+
+
+class ProjectEntryGroundingTests(unittest.TestCase):
+    def _analysis_for(self, question):
+        result = search_resume(question, PROJECT_RELATIONSHIP_RESUME)
+        messages = [
+            {"role": "user", "content": question},
+            {
+                "role": "tool",
+                "tool": "search_resume",
+                "arguments": {"query": question},
+                "result": result,
+            },
+        ]
+        return analyze_history(messages, PROJECT_RELATIONSHIP_RESUME)
+
+    def test_named_project_retrieval_prefers_project_over_global_skills(self):
+        result = search_resume(
+            "What framework was used in the Example Inventory Tool?",
+            PROJECT_RELATIONSHIP_RESUME,
+        )
+        evidence = "\n".join(result["results"])
+
+        self.assertIn("OtherProjectOnlyFramework", result["results"][0])
+        self.assertNotIn("GlobalOnlyFramework", evidence)
+        self.assertNotIn("CapstoneOnlyFramework", evidence)
+
+    def test_unmatched_named_project_does_not_fall_back_to_another_project(self):
+        result = search_resume(
+            "What framework was used in the Example Missing Tool?",
+            PROJECT_RELATIONSHIP_RESUME,
+        )
+        evidence = "\n".join(result["results"])
+
+        self.assertNotIn("CapstoneOnlyFramework", evidence)
+        self.assertNotIn("OtherProjectOnlyFramework", evidence)
+        self.assertNotIn("GlobalOnlyFramework", evidence)
+
+    def test_technology_in_target_project_supports_relationship(self):
+        question = "Did the candidate use CapstoneOnlyFramework in the capstone project?"
+        answer = "The candidate used CapstoneOnlyFramework in the capstone project."
+        analysis = self._analysis_for(question)
+
+        self.assertFalse(answer_has_unsupported_relationship_claims(answer, analysis))
+
+    def test_skills_only_technology_does_not_support_project_relationship(self):
+        question = "Did the candidate use GlobalOnlyFramework in the capstone project?"
+        answer = "The candidate used GlobalOnlyFramework in the capstone project."
+        analysis = self._analysis_for(question)
+
+        self.assertTrue(answer_has_unsupported_relationship_claims(answer, analysis))
+
+    def test_other_project_technology_does_not_support_capstone_relationship(self):
+        question = "Did the candidate use OtherProjectOnlyFramework in the capstone project?"
+        answer = "The candidate used OtherProjectOnlyFramework in the capstone project."
+        analysis = self._analysis_for(question)
+
+        self.assertTrue(answer_has_unsupported_relationship_claims(answer, analysis))
+
+    def test_experience_technology_does_not_support_project_relationship(self):
+        question = "Did the candidate use ExperienceOnlyFramework in the capstone project?"
+        answer = "The candidate used ExperienceOnlyFramework in the capstone project."
+        analysis = self._analysis_for(question)
+
+        self.assertTrue(answer_has_unsupported_relationship_claims(answer, analysis))
+
+    def test_prior_denial_does_not_hide_later_unsupported_project_claim(self):
+        question = "Did the candidate use GlobalOnlyFramework in the capstone project?"
+        answer = (
+            "The resume does not establish that relationship, but the candidate used "
+            "GlobalOnlyFramework in the capstone project."
+        )
+        analysis = self._analysis_for(question)
+
+        self.assertTrue(answer_has_unsupported_relationship_claims(answer, analysis))
+
+    def test_grounding_replaces_unsupported_project_relationship_with_safe_fallback(self):
+        question = "Did the candidate use OtherProjectOnlyFramework in the capstone project?"
+        result = search_resume(question, PROJECT_RELATIONSHIP_RESUME)
+        state = AgentState(messages=[
+            {"role": "user", "content": question},
+            {
+                "role": "tool",
+                "tool": "search_resume",
+                "arguments": {"query": question},
+                "result": result,
+            },
+        ], resume_text=PROJECT_RELATIONSHIP_RESUME)
+        unsupported_answer = (
+            "The candidate used OtherProjectOnlyFramework in the capstone project."
+        )
+
+        with patch("agent_loop.ask_llm_for_decision", return_value={
+            "action": "final",
+            "answer": unsupported_answer,
+        }):
+            safe_answer = ground_final_answer(state, unsupported_answer)
+
+        self.assertNotIn(unsupported_answer, safe_answer)
+        self.assertIn("does not establish", safe_answer.lower())
+        self.assertFalse(state.grounding_verified)
+
+    def test_fallback_names_the_unestablished_project_technology_relationship(self):
+        question = "Was OtherProjectOnlyFramework used in the capstone project?"
+        result = search_resume(question, PROJECT_RELATIONSHIP_RESUME)
+        state = AgentState(messages=[
+            {"role": "user", "content": question},
+            {
+                "role": "tool",
+                "tool": "search_resume",
+                "arguments": {"query": question},
+                "result": result,
+            },
+        ], resume_text=PROJECT_RELATIONSHIP_RESUME)
+        answer = (
+            "According to the resume: CAPSTONE PROJECT uses CapstoneOnlyFramework; "
+            "OTHER PROJECT uses OtherProjectOnlyFramework."
+        )
+
+        with patch("agent_loop.ask_llm_for_decision", return_value={
+            "action": "final",
+            "answer": answer,
+        }):
+            grounded_answer = ground_final_answer(state, answer)
+
+        self.assertIn("does not establish", grounded_answer.lower())
+        self.assertIn("OtherProjectOnlyFramework", grounded_answer)
+        self.assertIn("capstone project", grounded_answer.lower())
+        self.assertFalse(state.grounding_verified)
+
+
+class FavoriteLanguageGroundingTests(unittest.TestCase):
+    def _favorite_state(self, resume):
+        question = "What is the candidate's favorite programming language?"
+        result = search_resume(question, resume)
+        return AgentState(messages=[
+            {"role": "user", "content": question},
+            {
+                "role": "tool",
+                "tool": "search_resume",
+                "arguments": {"query": question},
+                "result": result,
+            },
+        ], resume_text=resume)
+
+    def test_listed_languages_without_favorite_get_explicit_refusal(self):
+        resume = """Casey Morgan
+SKILLS
+Programming: LanguageAlpha, LanguageBeta
+"""
+        state = self._favorite_state(resume)
+        draft = "According to the resume: Programming languages: LanguageAlpha, LanguageBeta."
+
+        with patch("agent_loop.ask_llm_for_decision", return_value={
+            "action": "final",
+            "answer": draft,
+        }):
+            answer = ground_final_answer(state, draft)
+
+        self.assertIn("LanguageAlpha", answer)
+        self.assertIn("LanguageBeta", answer)
+        self.assertIn("does not state the candidate's favorite programming language", answer)
+        self.assertNotIn("LanguageAlpha is the candidate's favorite", answer)
+        self.assertFalse(state.grounding_verified)
+
+    def test_explicit_resume_favorite_remains_answerable(self):
+        resume = """Casey Morgan
+SKILLS
+Programming: LanguageAlpha, LanguageBeta
+Favorite programming language: LanguageBeta
+"""
+        state = self._favorite_state(resume)
+        answer = "LanguageBeta is the candidate's favorite programming language."
+
+        grounded_answer = ground_final_answer(state, answer)
+
+        self.assertEqual(grounded_answer, answer)
+        self.assertTrue(state.grounding_verified)
 
 
 class CandidateNameRoutingTests(unittest.TestCase):
