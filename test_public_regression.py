@@ -10,6 +10,7 @@ import api
 from agent_loop import (
     AgentState,
     analyze_history,
+    authoritative_employer_result,
     answer_contradicts_evidence,
     answer_has_unsupported_positive_claims,
     answer_has_unsupported_relationship_claims,
@@ -24,6 +25,9 @@ from agent_loop import (
     run_agent,
     search_resume,
     warm_up_ollama,
+    _normalize_tokens,
+    QUERY_META_WORDS,
+    SEARCH_STOPWORDS,
 )
 from resume_parser import parse_resume
 
@@ -49,6 +53,31 @@ SKILLS_EVIDENCE = "Python, React, PostgreSQL, Docker, Flutter"
 NO_NAME_RESUME = """EDUCATION
 Bachelor of Science in Information Systems
 Example University
+"""
+
+EDUCATION_INTENT_RESUME = """Alex Rivera
+EDUCATION
+Bachelor of Science in Information Systems
+Example University
+"""
+
+PROJECT_SCOPING_RESUME = """Alex Rivera
+PROJECT EXPERIENCE
+CAPSTONE PROJECT MANAGER
+Example Food Delivery App
+Built the app using ProjectOnlyFramework.
+
+OTHER PROJECT
+Technologies in this separate project: OtherOnlyFramework.
+
+EXPERIENCE
+Example Corporation
+Software Intern
+Built an internal system unrelated to the capstone.
+
+SKILLS
+GlobalOnlyFramework
+Python
 """
 
 
@@ -200,6 +229,162 @@ class GroundingRegressionTests(unittest.TestCase):
         self.assertIn("Built internal APIs using Python and PostgreSQL", fallback)
         self.assertIn("React", fallback)
         self.assertIn("does not establish the requested relationship", fallback)
+
+
+class EducationGroundingTests(unittest.TestCase):
+    def test_university_attendance_word_is_contextually_grounded(self):
+        question = "What university did the candidate attend?"
+        result = search_resume(question, EDUCATION_INTENT_RESUME)
+        state = AgentState(messages=[
+            {"role": "user", "content": question},
+            {
+                "role": "tool",
+                "tool": "search_resume",
+                "arguments": {"query": question},
+                "result": result,
+            },
+        ], resume_text=EDUCATION_INTENT_RESUME)
+
+        self.assertNotIn("attend", result.get("not_found_terms", []))
+        answer = ground_final_answer(state, "The candidate attended Example University.")
+
+        self.assertEqual(answer, "The candidate attended Example University.")
+        self.assertTrue(state.grounding_verified)
+
+    def test_education_context_does_not_allow_unsupported_claims(self):
+        question = "What university did the candidate attend?"
+        result = search_resume(question, EDUCATION_INTENT_RESUME)
+        state = AgentState(messages=[
+            {"role": "user", "content": question},
+            {
+                "role": "tool",
+                "tool": "search_resume",
+                "arguments": {"query": question},
+                "result": result,
+            },
+        ], resume_text=EDUCATION_INTENT_RESUME)
+        analysis = analyze_history(state.messages, state.resume_text)
+
+        unsupported = "The candidate attended Example University and worked at Fake Corporation."
+        self.assertTrue(answer_has_unsupported_positive_claims(unsupported, analysis))
+        self.assertTrue(answer_contradicts_evidence(unsupported, analysis))
+
+        missing_result = {
+            "category": "education",
+            "results": [],
+            "not_found_terms": ["university"],
+        }
+        missing_state = AgentState(messages=[
+            {"role": "user", "content": question},
+            {
+                "role": "tool",
+                "tool": "search_resume",
+                "arguments": {"query": question},
+                "result": missing_result,
+            },
+        ], resume_text="Alex Rivera\nSKILLS\nPython\n")
+        missing_analysis = analyze_history(missing_state.messages, missing_state.resume_text)
+        self.assertTrue(
+            answer_has_unsupported_positive_claims("The candidate attended.", missing_analysis)
+        )
+
+
+class EmployerResponsibilityIntentTests(unittest.TestCase):
+    def test_absent_employer_uses_authoritative_preflight_before_tool_selection(self):
+        question = "What were the candidate's responsibilities at Example Corporation?"
+        resume = """Alex Rivera
+EXPERIENCE
+Different Employer
+Operations Associate
+Handled scheduling.
+PROJECTS
+Example Project
+Built an example.
+"""
+        authoritative_result = authoritative_employer_result(question, resume)
+
+        self.assertIsNotNone(authoritative_result)
+        self.assertEqual(authoritative_result["employer_check"], "not_found")
+        self.assertEqual(authoritative_result["results"], [])
+
+        def final_from_authoritative_verdict(state, **_kwargs):
+            search_calls = [
+                message for message in state.messages
+                if message["role"] == "tool" and message.get("tool") == "search_resume"
+            ]
+            self.assertEqual(len(search_calls), 1)
+            self.assertEqual(search_calls[0]["result"]["employer_check"], "not_found")
+            self.assertEqual(state.employer_verdict["employer_check"], "not_found")
+            return {
+                "action": "final",
+                "answer": "The resume provides no evidence.",
+            }
+
+        with patch("agent_loop.ask_llm_for_decision", side_effect=final_from_authoritative_verdict) as ask_llm:
+            outcome = run_agent(question, resume)
+
+        self.assertEqual(outcome["tools_executed"], 1)
+        self.assertEqual(outcome["iterations"], 1)
+        self.assertEqual(outcome["tools_refused"], 0)
+        ask_llm.assert_called_once()
+        self.assertIn("no evidence", outcome["answer"].lower())
+
+    def test_present_employer_responsibilities_returns_matching_entry(self):
+        question = "What were the candidate's responsibilities at Example Corporation?"
+        result = search_resume(question, PROJECT_SCOPING_RESUME)
+
+        self.assertIn("Software Intern", "\n".join(result["results"]))
+        self.assertIn("Built an internal system unrelated to the capstone", "\n".join(result["results"]))
+        self.assertNotIn("employer_check", result)
+
+    def test_project_location_is_not_employer_intent(self):
+        question = "What were the candidate's responsibilities in Example Project?"
+        resume = """Alex Rivera
+EXPERIENCE
+Example Corporation
+Operations Associate
+Handled scheduling.
+PROJECTS
+Example Project
+Built an example.
+"""
+
+        self.assertIsNone(authoritative_employer_result(question, resume))
+
+    def test_duties_at_entity_uses_authoritative_employer_lookup(self):
+        question = "What were the candidate's duties at Missing Corporation?"
+        resume = "Alex Rivera\nEXPERIENCE\nExample Corporation\nOperations Associate\nHandled scheduling.\n"
+        result = authoritative_employer_result(question, resume)
+
+        self.assertIsNotNone(result)
+        self.assertEqual(result["employer_check"], "not_found")
+
+
+class ProjectTechnologyScopingTests(unittest.TestCase):
+    def test_project_technology_query_uses_matching_project_not_global_skills(self):
+        question = "What technologies did the candidate use in their capstone project?"
+        result = search_resume(question, PROJECT_SCOPING_RESUME)
+        evidence = "\n".join(result["results"])
+        query_terms = set(_normalize_tokens(question)) - SEARCH_STOPWORDS - QUERY_META_WORDS
+        project_entries = parse_resume(PROJECT_SCOPING_RESUME)["projects"]
+        flat_scores = [
+            len(query_terms & set(_normalize_tokens(entry["raw_text"])))
+            for entry in project_entries
+        ]
+
+        self.assertEqual(flat_scores, [2, 2])
+        self.assertIn("ProjectOnlyFramework", evidence)
+        self.assertNotIn("GlobalOnlyFramework", evidence)
+        self.assertNotIn("internal system unrelated to the capstone", evidence)
+        self.assertNotIn("OTHER PROJECT", evidence)
+
+    def test_general_technology_question_still_returns_skills(self):
+        result = search_resume(
+            "What technologies does the candidate know?",
+            PROJECT_SCOPING_RESUME,
+        )
+
+        self.assertIn("GlobalOnlyFramework", "\n".join(result["results"]))
 
 
 class CandidateNameRoutingTests(unittest.TestCase):

@@ -240,6 +240,8 @@ QUERY_META_WORDS = {
     "related", "most", "best", "strongest", "closest", "directly", "suited",
 }
 
+EDUCATION_ATTENDANCE_WORDS = {"attend", "attends", "attended", "attending"}
+
 
 def _is_candidate_name_query(tokens):
     if "candidate" not in tokens:
@@ -287,6 +289,8 @@ EMPLOYER_VERB_WORDS = {
     "employ", "employed", "employer", "employment",
     "hire", "hired",
 }
+
+_EMPLOYER_RESPONSIBILITY_ASPECT_WORDS = {"responsibility", "duty"}
 
 # Words that can appear in an employer question without naming the
 # organization itself ("Was Google ONE of my employers?", "Is X LISTED as
@@ -342,6 +346,88 @@ def _normalize(word):
 
 def _normalize_tokens(text):
     return [_normalize(token) for token in _tokenize(text)]
+
+
+def _query_matches_concept(query, concept_name):
+    words = _normalize_tokens(query)
+    return any(
+        tuple(words[start:start + len(phrase)]) == phrase
+        for phrase in CONCEPT_TRIGGERS[concept_name]
+        for start in range(len(words) - len(phrase) + 1)
+    )
+
+
+def _has_responsibility_employer_intent(tokens, words):
+    for position, word in enumerate(words):
+        if word not in _EMPLOYER_RESPONSIBILITY_ASPECT_WORDS:
+            continue
+        entity_start = position + 1
+        if entity_start >= len(words) or words[entity_start] != "at":
+            continue
+        return any(
+            token not in SEARCH_STOPWORDS
+            and candidate not in QUERY_META_WORDS
+            and candidate not in _EMPLOYER_RESPONSIBILITY_ASPECT_WORDS
+            for token, candidate in zip(tokens[entity_start + 1:], words[entity_start + 1:])
+        )
+    return False
+
+
+def _query_has_employment_intent(tokens, words):
+    return (
+        any(
+            token in EMPLOYER_VERB_WORDS or word in EMPLOYER_VERB_WORDS
+            for token, word in zip(tokens, words)
+        )
+        or _has_responsibility_employer_intent(tokens, words)
+    )
+
+
+def _is_project_technology_query(matched_concepts, tokens):
+    return (
+        "project" in matched_concepts
+        and "skills" in matched_concepts
+        and any(token in {"use", "used", "using"} for token in tokens)
+    )
+
+
+def _select_project_entries(entries, query_words):
+    candidates = []
+    query_terms = {
+        word for word in query_words
+        if word not in SEARCH_STOPWORDS and word not in QUERY_META_WORDS
+    }
+
+    for entry in entries:
+        if not isinstance(entry, dict) or not entry.get("raw_text"):
+            continue
+        entry_terms = set(_normalize_tokens(entry["raw_text"]))
+        first_line = next(
+            (line.strip() for line in entry["raw_text"].splitlines() if line.strip()),
+            "",
+        )
+        header_terms = set(_normalize_tokens(first_line))
+        candidates.append((entry, entry_terms, header_terms))
+
+    if not candidates:
+        return []
+
+    term_frequency = {
+        term: sum(term in entry_terms for _entry, entry_terms, _header in candidates)
+        for term in query_terms
+    }
+    scored = []
+    for entry, entry_terms, header_terms in candidates:
+        matched_terms = query_terms & entry_terms
+        score = (
+            len(query_terms & header_terms),
+            sum(term_frequency[term] == 1 for term in matched_terms),
+            len(matched_terms),
+        )
+        scored.append((score, entry))
+
+    best_score, best_entry = max(scored, key=lambda item: item[0])
+    return [best_entry] if best_score != (0, 0, 0) else []
 
 
 def _original_tokens(query, tokens):
@@ -962,10 +1048,7 @@ def _extract_employer_query_groups(tokens, words, handled, original_tokens):
     ([], set()) when it does but names no organization (a broad question
     such as "Where have I worked?", answered by the normal EXPERIENCE path).
     """
-    has_employment_word = any(
-        token in EMPLOYER_VERB_WORDS or word in EMPLOYER_VERB_WORDS
-        for token, word in zip(tokens, words)
-    )
+    has_employment_word = _query_has_employment_intent(tokens, words)
     if not has_employment_word:
         return None, set()
 
@@ -1230,6 +1313,12 @@ def search_resume(query, resume_text=None):
         if concept_hit:
             matched_concepts.append(name)
 
+    project_technology_query = _is_project_technology_query(matched_concepts, tokens)
+    education_attendance_query = (
+        "education" in matched_concepts
+        and any(_normalize(word) in EDUCATION_ATTENDANCE_WORDS for word in words)
+    )
+
     # ---- Employer verification (NEW) --------------------------------------
     # "Did I work at Google?" / "Was I employed by X?" / "Was X one of my
     # employers?" name a specific organization. Such an organization is
@@ -1240,10 +1329,7 @@ def search_resume(query, resume_text=None):
     # concept (a question like "Is X an employer or a technology?").
     # Broad questions naming no organization ("Where have I worked?") return
     # an empty group list and continue through the normal EXPERIENCE path.
-    query_has_employment_word = any(
-        token in EMPLOYER_VERB_WORDS or word in EMPLOYER_VERB_WORDS
-        for token, word in zip(tokens, words)
-    )
+    query_has_employment_word = _query_has_employment_intent(tokens, words)
 
     employer_groups, name_positions = _extract_employer_query_groups(
         tokens, words, handled, _original_tokens(query, tokens)
@@ -1315,6 +1401,8 @@ def search_resume(query, resume_text=None):
             # branch above still treats it as a normal literal match,
             # exactly as before.)
             continue
+        if education_attendance_query and word in EDUCATION_ATTENDANCE_WORDS:
+            continue
         if token not in not_found_terms:
             not_found_terms.append(token)
 
@@ -1359,6 +1447,9 @@ def search_resume(query, resume_text=None):
         used_concepts = specific
     else:
         used_concepts = generic
+
+    if project_technology_query:
+        used_concepts = ["project"]
 
     # ---- Relevance / ranking questions (NEW) -------------------------------
     # "What experience is most directly related to software development?"
@@ -1465,8 +1556,11 @@ def search_resume(query, resume_text=None):
 
         if struct_key:
             structured = get_structured_resume(text)
+            section_entries = structured.get(struct_key, [])
+            if project_technology_query and name == "project":
+                section_entries = _select_project_entries(section_entries, words)
             structured_blocks = [
-                entry["raw_text"] for entry in structured.get(struct_key, []) if entry["raw_text"]
+                entry["raw_text"] for entry in section_entries if entry["raw_text"]
             ]
 
             # NEW: for EXPERIENCE, first surface each entry's employer /
@@ -1508,7 +1602,7 @@ def search_resume(query, resume_text=None):
             for line in keyword_lines:
                 if _fact_in_blocks(line, structured_blocks):
                     _add_fact(line, TIER_IN_SECTION)
-                else:
+                elif not project_technology_query:
                     _add_fact(line, TIER_GENERIC_KEYWORD)
         else:
             # No structured section exists for this concept at all (e.g.
@@ -2148,6 +2242,16 @@ def _current_evidence_groups(classified, resume_text):
 def analyze_history(messages, resume_text=None):
     all_facts = []
     any_tool_ran = False
+    question = next(
+        (message["content"] for message in messages if message["role"] == "user"),
+        "",
+    )
+    contextual_answer_tokens = set()
+    if (
+        _query_matches_concept(question, "education")
+        and any(_normalize(token) in EDUCATION_ATTENDANCE_WORDS for token in _tokenize(question))
+    ):
+        contextual_answer_tokens.add("attend")
 
     # First pass: classify every executed tool call exactly once, using the
     # existing classify_evidence() status strings ("SUPPORTED" / "PARTIAL" /
@@ -2203,9 +2307,16 @@ def analyze_history(messages, resume_text=None):
             if term not in gap_terms:
                 gap_terms.append(term)
 
+    evidence_groups = _current_evidence_groups(classified, resume_text)
+    if contextual_answer_tokens and not any(
+        group.get("section") == "education" for group in evidence_groups
+    ):
+        contextual_answer_tokens.clear()
+
     return {
         "facts": all_facts,
-        "evidence_groups": _current_evidence_groups(classified, resume_text),
+        "evidence_groups": evidence_groups,
+        "contextual_answer_tokens": contextual_answer_tokens,
         "gap_terms": gap_terms,
         "has_evidence": bool(all_facts),
         "has_gap": has_gap,
@@ -2479,6 +2590,7 @@ def answer_has_unsupported_positive_claims(answer, analysis):
         | QUERY_META_WORDS
         | ENTRY_ASPECT_WORDS
         | ANSWER_FRAMING_WORDS
+        | set(analysis.get("contextual_answer_tokens", ()))
     )
     negated_gap_tokens = set()
     gap_token_sets = [
