@@ -1,7 +1,9 @@
+
 """Public, deterministic regression tests using synthetic resume data only."""
 
 import unittest
 from unittest.mock import Mock, patch
+from uuid import uuid4
 
 import pymupdf
 from fastapi.testclient import TestClient
@@ -734,11 +736,11 @@ class OllamaWarmupTests(unittest.TestCase):
 
 class UploadPrivacyAndSizeTests(unittest.TestCase):
     def setUp(self):
-        self.previous_active_resume = api.get_active_resume_text()
-        api.set_active_resume_text("")
+        self.session_id = uuid4()
 
     def tearDown(self):
-        api.set_active_resume_text(self.previous_active_resume)
+        # Keep test state isolated. Each test uses its own session ID.
+        api.set_active_resume_text(self.session_id, "")
 
     def test_metadata_only_upload_size_limit_and_rejected_upload_state(self):
         pdf_bytes = make_synthetic_pdf()
@@ -747,9 +749,18 @@ class UploadPrivacyAndSizeTests(unittest.TestCase):
         with patch("api.warm_up_ollama"), TestClient(api.app) as client:
             success = client.post(
                 "/upload-resume",
-                files={"file": ("synthetic-resume.pdf", pdf_bytes, "application/pdf")},
+                data={"session_id": str(self.session_id)},
+                files={
+                    "file": (
+                        "synthetic-resume.pdf",
+                        pdf_bytes,
+                        "application/pdf",
+                    )
+                },
             )
+
             self.assertEqual(success.status_code, 200, success.text)
+
             payload = success.json()
             self.assertEqual(set(payload), {"filename", "pages"})
             self.assertEqual(payload["filename"], "synthetic-resume.pdf")
@@ -757,11 +768,12 @@ class UploadPrivacyAndSizeTests(unittest.TestCase):
             self.assertNotIn("raw_text", payload)
             self.assertNotIn("text", payload)
 
-            active_resume = api.get_active_resume_text()
+            active_resume = api.get_active_resume_text(self.session_id)
             self.assertTrue(active_resume)
 
             oversized = client.post(
                 "/upload-resume",
+                data={"session_id": str(self.session_id)},
                 files={
                     "file": (
                         "oversized.pdf",
@@ -770,9 +782,15 @@ class UploadPrivacyAndSizeTests(unittest.TestCase):
                     )
                 },
             )
+
             self.assertEqual(oversized.status_code, 413, oversized.text)
             self.assertIn("10 MiB", oversized.json()["detail"])
-            self.assertEqual(api.get_active_resume_text(), active_resume)
+
+            # A rejected upload must not replace the previously accepted resume.
+            self.assertEqual(
+                api.get_active_resume_text(self.session_id),
+                active_resume,
+            )
 
 
 if __name__ == "__main__":

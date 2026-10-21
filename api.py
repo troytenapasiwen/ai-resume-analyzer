@@ -200,9 +200,10 @@ import asyncio
 import logging
 import re
 import threading
+from uuid import UUID
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, File, HTTPException, UploadFile
+from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from pydantic import BaseModel, ConfigDict, Field
 
 # resume_extractor.py turns PDF bytes into text in VISUAL reading order
@@ -264,24 +265,19 @@ from resume_parser import normalize_pdf_text
 # stronger isolation than that (see the module docstring's note about this
 # being a single, process-wide value for now, not a per-user one).
 _active_resume_lock = threading.Lock()
-_active_resume_text = ""
+_active_resume_texts: dict[UUID, str] = {}
 
 
-def get_active_resume_text():
-    """Return the resume text /chat should currently use."""
+def get_active_resume_text(session_id: UUID):
+    """Return the resume belonging to one session, if it exists."""
     with _active_resume_lock:
-        return _active_resume_text
+        return _active_resume_texts.get(session_id, "")
 
 
-def set_active_resume_text(new_text):
-    """Replace the active resume text (called after a successful PDF upload).
-    Callers are expected to have already normalized new_text (see
-    upload_resume()); this function does not normalize again itself, since
-    it may also be used to restore a value that is already known to be
-    normalized."""
-    global _active_resume_text
+def set_active_resume_text(session_id: UUID, new_text: str):
+    """Replace only the resume associated with the supplied session."""
     with _active_resume_lock:
-        _active_resume_text = new_text
+        _active_resume_texts[session_id] = new_text
 
 
 # ============================================================
@@ -428,9 +424,13 @@ def looks_like_a_resume(text):
 class ChatRequest(BaseModel):
     """The JSON body the client must send to POST /chat."""
 
-    # str_strip_whitespace removes spaces around the text BEFORE the length
-    # checks run, so a question made only of spaces counts as empty.
+    # Strip whitespace before validating the question.
     model_config = ConfigDict(str_strip_whitespace=True)
+
+    session_id: UUID = Field(
+        ...,
+        description="The UUID identifying this app session.",
+    )
 
     # min_length=1     -> empty questions are rejected (HTTP 422)
     # max_length=...   -> same limit the terminal version of the agent uses
@@ -566,7 +566,7 @@ def chat(request: ChatRequest):
     # agent will be grounded in for this question. It is already normalized
     # (see upload_resume() below), so run_agent() and its tools can match
     # keywords against it directly.
-    active_resume_text = get_active_resume_text()
+    active_resume_text = get_active_resume_text(request.session_id)
 
     if not active_resume_text or not active_resume_text.strip():
         raise HTTPException(
@@ -630,7 +630,10 @@ def chat(request: ChatRequest):
 # and (on success) updates the in-memory active resume that /chat reads on
 # every request.
 @app.post("/upload-resume", response_model=UploadResumeResponse)
-def upload_resume(file: UploadFile = File(...)):
+def upload_resume(
+    file: UploadFile = File(...),
+    session_id: UUID = Form(...),
+):
     """POST /upload-resume  ->  accept a PDF resume, extract its text in
     visual reading order, NORMALIZE it, check that it really looks like a
     resume, and make the normalized text the ACTIVE resume used by /chat.
@@ -804,7 +807,7 @@ def upload_resume(file: UploadFile = File(...)):
     # restarts. This is the ONLY place in the whole application that
     # changes the active resume. resume.txt is never opened, read, or
     # written here; only normalized_text is retained as active state.
-    set_active_resume_text(normalized_text)
+    set_active_resume_text(session_id, normalized_text)
 
     # ---- 8. Return the result ----
     return UploadResumeResponse(

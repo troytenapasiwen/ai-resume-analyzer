@@ -36,8 +36,13 @@ analysis_results.json
 rag_evaluation_results.json
 results_*.json
 trace_prompts.txt
+invalid-test.pdf
+synthetic-test-resume*.pdf
 
 # Local backups and working copies
+*.backup-*
+*.bak-*
+backups/
 agent_loop.py.backup
 agent_loop.py.bak_before_relevance_fix
 agent_loop.py.working

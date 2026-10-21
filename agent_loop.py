@@ -391,7 +391,48 @@ def _is_project_technology_query(matched_concepts, tokens):
     )
 
 
+def _is_named_project_technology_query(tokens, words):
+    if not any(
+        token in {
+            "framework", "frameworks", "technology", "technologies",
+            "tool", "tools",
+        }
+        for token in tokens
+    ) or not any(
+        token in {
+            "use", "used", "using", "develop", "developed", "build",
+            "built", "implement", "implemented", "create", "created",
+        }
+        for token in tokens
+    ):
+        return False
+
+    for position, word in enumerate(words):
+        if word not in {"in", "within"}:
+            continue
+        following = [
+            following_word.lower()
+            for following_word in words[position + 1:]
+            if following_word.lower() not in {"the", "a", "an", "my", "our", "your", "their"}
+        ]
+        if not following:
+            continue
+        if any(
+            term in {"project", "projects", "capstone", "portfolio", "work"}
+            for term in following
+        ):
+            continue
+        return True
+
+    return False
+
+
 def _select_project_entries(entries, query_words):
+    """Select a project entry by generic query/content overlap.
+
+    This function is retained for broad project intent, but named project
+    queries are resolved separately against the parsed entry identity.
+    """
     candidates = []
     query_terms = {
         word for word in query_words
@@ -430,19 +471,119 @@ def _select_project_entries(entries, query_words):
     return [best_entry] if best_score != (0, 0, 0) else []
 
 
-def _project_reference_terms(words):
-    for position in range(len(words) - 1, -1, -1):
-        if words[position] not in {"in", "within", "for", "on"}:
+def _match_parsed_project_entry(entries, query_words):
+    """Resolve a named project against the parsed project-entry identity.
+
+    The query and resume are compared as normalized tokens. The first line of
+    each parsed project entry is treated as its structured title, and the
+    strongest title match is returned. No technology vocabulary or project
+    aliases are involved.
+    """
+    if not isinstance(entries, list):
+        return None
+
+    query_terms = [
+        word for word in query_words
+        if word not in SEARCH_STOPWORDS
+        and word not in QUERY_META_WORDS
+    ]
+    if not query_terms:
+        return None
+
+    best_match = None
+    best_score = (0, 0)
+    for index, entry in enumerate(entries):
+        if not isinstance(entry, dict) or not entry.get("raw_text"):
             continue
-        terms = [
-            word for word in words[position + 1:]
-            if word not in SEARCH_STOPWORDS
-            and word not in QUERY_META_WORDS
-            and word not in {"project", "projects"}
+        candidates = [
+            line.strip()
+            for line in entry["raw_text"].splitlines()
+            if line.strip()
         ]
-        if terms:
-            return terms
-    return []
+        for title in candidates:
+            title_tokens = [
+                word for word in _normalize_tokens(title)
+                if word and word not in SEARCH_STOPWORDS and word not in QUERY_META_WORDS
+            ]
+            if not title_tokens:
+                continue
+
+            title_match = any(
+                query_terms[start:start + len(title_tokens)] == title_tokens
+                for start in range(len(query_terms) - len(title_tokens) + 1)
+            )
+            if not title_match:
+                continue
+
+            score = (len(title_tokens), len(title_tokens))
+            if score > best_score:
+                best_score = score
+                best_match = (index, entry, set(title_tokens), title)
+
+    return best_match
+
+
+def _project_header_lines(entry):
+    """Return the parsed project identity line for entry-scoped retrieval.
+
+    The parser preserves each project as a structured entry. Its first line is
+    the project title/header; later role labels and duty sentences are body
+    content and must not be treated as project identity. This is generic for
+    arbitrary titles and does not inspect candidate-specific values.
+    """
+    if not isinstance(entry, dict):
+        return []
+
+    raw_text = entry.get("raw_text", "")
+    lines = [line.strip() for line in raw_text.splitlines() if line.strip()]
+    return [lines[0]] if lines else []
+
+
+def _isolated_project_evidence(entry, matched_title_terms):
+    """Return the evidence belonging to one named project within a block.
+
+    The parser intentionally preserves a project section as one raw_text
+    entry when project titles are not separated by blank lines. A generic
+    ``Project <name>`` title prefix is therefore used only as an evidence
+    boundary; no concrete resume title or technology is hardcoded.
+    """
+    raw_text = entry.get("raw_text", "") if isinstance(entry, dict) else ""
+    lines = [line.strip() for line in raw_text.splitlines() if line.strip()]
+    if not lines:
+        return []
+
+    title_line_index = None
+    for index, line in enumerate(lines):
+        line_terms = set(_normalize_tokens(line))
+        if matched_title_terms and line_terms >= matched_title_terms:
+            title_line_index = index
+            break
+
+    if title_line_index is None:
+        return [raw_text]
+
+    end_index = len(lines)
+    seen_duty = False
+    for index in range(title_line_index + 1, len(lines)):
+        candidate = lines[index]
+        lower = candidate.lower()
+        if re.match(r"^project\b", candidate, re.IGNORECASE):
+            end_index = index
+            break
+        if lower.startswith(("used ", "using ", "built ", "build ", "developed ", "develop ", "implemented ", "implement ", "create ", "created ", "- ", "* ", "• ")):
+            seen_duty = True
+            continue
+        has_title_shape = (
+            len(candidate.split()) <= 8
+            and any(ch.isalpha() for ch in candidate)
+            and not any(keyword in lower for keyword in (" using ", " built ", " developed ", " implemented ", " created ", " technology ", " technologies ", " tool ", " tools ", " skills "))
+        )
+        if seen_duty and has_title_shape:
+            end_index = index
+            break
+
+    isolated = lines[title_line_index:end_index]
+    return ["\n".join(isolated)] if isolated else []
 
 
 def _contains_ordered_terms(text, terms):
@@ -540,9 +681,34 @@ def _split_generic_skill_items(value):
     return items
 
 
+def _looks_like_code_identifier(value):
+    """Conservative heuristic: code-like names are technical, plain-language
+    labels are not."""
+    if not value:
+        return False
+    candidate = value.strip()
+    if not candidate:
+        return False
+    if any(ch in candidate for ch in "#._+-/()[]{}"):
+        return True
+    if any(ch.isdigit() for ch in candidate):
+        return True
+    if re.search(r"[a-z][A-Z]", candidate):
+        return True
+    if re.search(r"[A-Z][a-z]+[A-Z]", candidate):
+        return True
+    return False
+
+
 def _extract_resume_skill_sections(resume_text):
     """Keep only resume-derived skill evidence and preserve the original
-    wording when the resume labels a category explicitly."""
+    wording when the resume labels a category explicitly.
+
+    Conserve classification: a label such as "Languages" is only treated as a
+    programming-language bucket when the actual skill values themselves look
+    technical. Plain spoken languages such as English/Spanish are kept out of
+    programming_languages.
+    """
     if not resume_text:
         return {
             "programming_languages": [],
@@ -556,25 +722,49 @@ def _extract_resume_skill_sections(resume_text):
         "development_tools": [],
     }
 
-    def category_for_label(label):
+    def category_for_label(label, remainder):
         normalized = re.sub(r"[^a-z0-9]+", " ", label.lower()).strip()
-        if "programming" in normalized or normalized in {"language", "languages"}:
+        items = _split_generic_skill_items(remainder.strip())
+        if "programming" in normalized or "coding" in normalized or "software" in normalized:
             return "programming_languages"
+        if "language" in normalized:
+            if any(_looks_like_code_identifier(item) for item in items):
+                return "programming_languages"
+            return "frameworks_and_technologies"
         if "technolog" in normalized or "framework" in normalized or "stack" in normalized:
             return "frameworks_and_technologies"
         if "tool" in normalized or "tooling" in normalized:
             return "development_tools"
         return "frameworks_and_technologies"
 
-    for raw_line in resume_text.splitlines():
-        line = raw_line.strip()
-        if not line:
-            continue
+    lines = [line.strip() for line in resume_text.splitlines() if line.strip()]
+    index = 0
+    while index < len(lines):
+        line = lines[index]
         label, separator, remainder = line.partition(":")
-        if not separator or not label.strip() or not remainder.strip():
+        if separator and label.strip() and remainder.strip():
+            category = category_for_label(label, remainder)
+            result[category].extend(_split_generic_skill_items(remainder.strip()))
+            index += 1
             continue
-        category = category_for_label(label)
-        result[category].extend(_split_generic_skill_items(remainder.strip()))
+
+        normalized_label = re.sub(r"[^a-z0-9]+", " ", label.lower()).strip()
+        if normalized_label and index + 1 < len(lines):
+            continuation = lines[index + 1]
+            if normalized_label in {"programming", "programming languages", "coding", "languages"}:
+                category = category_for_label(
+                    label,
+                    continuation,
+                )
+                result[category].extend(_split_generic_skill_items(continuation))
+                index += 2
+                continue
+
+        if normalized_label and not separator:
+            result["frameworks_and_technologies"].extend(
+                _split_generic_skill_items(line)
+            )
+        index += 1
 
     return result
 
@@ -1447,23 +1637,48 @@ def search_resume(query, resume_text=None):
             lines=lines,
         )
 
-    structured_project_blocks = {
-        entry.get("raw_text")
-        for entry in structured.get("projects") or []
-        if isinstance(entry, dict) and entry.get("raw_text")
-    }
-    project_reference = _project_reference_terms(words)
-    named_project_blocks = [
-        block for block in structured_project_blocks
-        if _contains_ordered_terms(block, project_reference)
-    ]
-    named_project_technology_query = (
-        bool(project_reference)
-        and "skills" in matched_concepts
-        and any(token in {"use", "used", "using"} for token in tokens)
+    project_entries = structured.get("projects") or []
+    matched_project = _match_parsed_project_entry(project_entries, words)
+    named_project_entry = matched_project[1] if matched_project else None
+    named_project_entry_index = matched_project[0] if matched_project else None
+    matched_project_title = matched_project[3] if matched_project else ""
+    matched_project_title_terms = set(
+        _normalize_tokens(matched_project_title)
     )
-    if named_project_technology_query:
-        project_technology_query = True
+    project_title_overlap = bool(
+        project_entries
+        and any(
+            set(_normalize_tokens(title_line)) & set(words)
+            for entry in project_entries
+            if isinstance(entry, dict)
+            for title_line in _project_header_lines(entry)
+        )
+    )
+    named_project_blocks = (
+        _isolated_project_evidence(
+            named_project_entry,
+            matched_project_title_terms,
+        )
+        if named_project_entry
+        else []
+    )
+    named_project_technology_query = bool(
+        named_project_entry
+        and (
+            "project" in matched_concepts
+            or any(token in {"use", "used", "using", "develop", "developed", "build", "built", "implement", "implemented", "create", "created"} for token in tokens)
+        )
+    )
+    project_technology_query = (
+        named_project_technology_query
+        or _is_project_technology_query(matched_concepts, tokens)
+    )
+    unmatched_named_project = (
+        matched_project is None
+        and _is_named_project_technology_query(tokens, words)
+    )
+    if unmatched_named_project:
+        entity_blocks = []
 
     specific = [name for name in matched_concepts if not CONCEPTS[name]["generic"]]
     generic = [name for name in matched_concepts if CONCEPTS[name]["generic"]]
@@ -1478,12 +1693,16 @@ def search_resume(query, resume_text=None):
     # incorrectly empty out a perfectly good general answer (e.g. "What did
     # I do during my internship?") just because one unrelated word in the
     # question had no literal hit.
-    if specific or literal_facts:
+    if unmatched_named_project:
+        used_concepts = []
+        literal_facts = []
+        entity_blocks = []
+    elif specific or literal_facts:
         used_concepts = specific
     else:
         used_concepts = generic
 
-    if project_technology_query:
+    if project_technology_query and not unmatched_named_project:
         used_concepts = ["project"]
 
     # ---- Relevance / ranking questions (NEW) -------------------------------
@@ -1592,14 +1811,13 @@ def search_resume(query, resume_text=None):
         if struct_key:
             structured = get_structured_resume(text)
             section_entries = structured.get(struct_key, [])
-            if project_technology_query and name == "project":
-                if named_project_technology_query:
-                    section_entries = [
-                        entry for entry in section_entries
-                        if isinstance(entry, dict) and entry.get("raw_text") in named_project_blocks
-                    ]
-                else:
-                    section_entries = _select_project_entries(section_entries, words)
+            if named_project_technology_query and name == "project":
+                section_entries = [
+                    {"raw_text": block}
+                    for block in named_project_blocks
+                ]
+            elif project_technology_query and name == "project":
+                section_entries = _select_project_entries(section_entries, words)
             structured_blocks = [
                 entry["raw_text"] for entry in section_entries if entry["raw_text"]
             ]
@@ -1679,11 +1897,16 @@ def search_resume(query, resume_text=None):
         if employer_entry["summary"]
     }
 
-    for block in entity_blocks:
-        if named_project_technology_query and block not in named_project_blocks:
-            continue
-        _add_fact(employer_summary_by_block.get(block), TIER_ENTITY_MATCH)
-        _add_fact(block, TIER_ENTITY_MATCH)
+    if named_project_technology_query and named_project_blocks:
+        for block in named_project_blocks:
+            _add_fact(block, TIER_ENTITY_MATCH)
+        for line in literal_facts:
+            if any(line in block or block in line for block in named_project_blocks):
+                _add_fact(line, TIER_LITERAL)
+    else:
+        for block in entity_blocks:
+            _add_fact(employer_summary_by_block.get(block), TIER_ENTITY_MATCH)
+            _add_fact(block, TIER_ENTITY_MATCH)
 
     for line in literal_facts:
         if named_project_technology_query and not any(
@@ -1722,7 +1945,34 @@ def search_resume(query, resume_text=None):
         "results": results,
     }
 
-    if not results:
+    named_project_evidence = "\n".join(named_project_blocks)
+    request_terms = {
+        term
+        for term in words
+        if term not in SEARCH_STOPWORDS
+        and term not in QUERY_META_WORDS
+        and term not in matched_project_title_terms
+        and term not in {
+            "project", "projects", "use", "used", "using", "develop",
+            "developed", "build", "built", "implement", "implemented",
+            "create", "created", "technology", "technologies",
+        }
+    }
+    project_relationship_unsupported = bool(
+        named_project_entry
+        and named_project_technology_query
+        and request_terms
+        and not request_terms.intersection(
+            _normalize_tokens(named_project_evidence)
+        )
+    )
+
+    if project_relationship_unsupported:
+        output["message"] = (
+            "The resume does not establish the requested technology relationship "
+            "for the matched project."
+        )
+    elif not results:
         output["message"] = "No matching resume facts found."
 
     if not_found_terms:
@@ -3360,6 +3610,16 @@ def authoritative_employer_result(question, resume_text):
     (marked employer_check == "not_found"); otherwise None and nothing
     changes. Generic: no organization name is referenced anywhere.
     """
+    # This shortcut is only for employer-focused questions. A multi-topic
+    # question must continue through the normal agent so education, skills,
+    # projects, and other requested sections can still be retrieved.
+    matched_concepts = {
+        name for name in CONCEPTS
+        if _query_matches_concept(question, name)
+    }
+    if matched_concepts - {"experience", "skills"}:
+        return None
+
     try:
         result = search_resume(question, resume_text)
     except Exception:
@@ -3385,7 +3645,7 @@ def ground_final_answer(state, answer):
     def satisfies_explicit_refusals(candidate):
         if (
             project_refusal_required
-            and not _answer_explicitly_disclaims_project_relation(candidate)
+            and not _answer_explicitly_disclaims_project_relationship(candidate)
         ):
             return False
         if favorite_refusal_required and (
@@ -3533,6 +3793,34 @@ def run_agent(user_question, resume_text=None):
                 answer = build_fallback_answer(analysis, user_question)
 
             return make_outcome(state, "final", answer)
+
+        education_query = (
+            _query_matches_concept(user_question, "education")
+            and any(
+                _normalize(token) in EDUCATION_ATTENDANCE_WORDS
+                or _normalize(token) in {"school", "college", "university", "degree", "academic"}
+                for token in _tokenize(user_question)
+            )
+        )
+
+        if education_query:
+            arguments = {"query": user_question}
+            result = search_resume(resume_text=state.resume_text, **arguments)
+            state.iteration = 1
+            state.tool_calls_used += 1
+            state.tools_executed += 1
+            executed = {
+                "role": "tool",
+                "tool": "search_resume",
+                "arguments": arguments,
+                "result": result,
+            }
+            state.messages.append(executed)
+            state.previous_calls[make_call_key("search_resume", arguments)] = executed
+            facts = [fact for fact in result.get("results", []) if isinstance(fact, str) and fact.strip()]
+            if facts:
+                answer = ground_final_answer(state, facts[0])
+                return make_outcome(state, "final", answer)
 
         # An employment question naming an organization that is NOT an
         # EXPERIENCE employer is answered from that check alone: the result

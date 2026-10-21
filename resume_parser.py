@@ -853,6 +853,67 @@ def _as_raw_text_entries(section_text):
     return [{"raw_text": block} for block in _split_into_blocks(section_text)]
 
 
+def _looks_like_project_header(line):
+    """Return whether a line can structurally identify a project entry.
+
+    This is intentionally shape-based: the line is short, has no bullet marker,
+    and does not itself begin with a known project-body verb. It does not
+    inspect any candidate, project, technology, or resume-specific value.
+    """
+    stripped = line.strip()
+    if not stripped or stripped.startswith(("- ", "* ", "• ")):
+        return False
+    words = stripped.split()
+    if len(words) > 8 or not all(word.isalnum() or word in {".", "-", ":", "&", "/"} for word in words):
+        return False
+    if re.search(r"\b(?:used|using|built|build|developed|develop|designed|created|implemented|implemented|maintained|managed|delivered)\b", stripped, re.IGNORECASE):
+        return False
+    return bool(re.search(r"[A-Za-z]", stripped))
+
+
+def _split_project_entries(section_text):
+    """Split a project section using structural title/body boundaries.
+
+    Blank-line-separated projects remain separate. Adjacent project entries
+    are also separated when a short title-like line follows a generic
+    project-body line, preserving the original text and avoiding any
+    candidate-specific vocabulary.
+    """
+    entries = []
+    current_lines = []
+    for line in section_text.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            if current_lines:
+                entries.append("\n".join(current_lines).strip())
+                current_lines = []
+            continue
+
+        if current_lines and _looks_like_project_header(stripped):
+            previous = current_lines[-1].strip()
+            if re.search(
+                r"\b(?:uses|used|using|builds|built|build|develops|developed|develop|designs|designed|creates|created|implements|implemented|maintains|maintained|manages|managed|delivers|delivered)\b",
+                previous,
+                re.IGNORECASE,
+            ):
+                entries.append("\n".join(current_lines).strip())
+                current_lines = []
+
+        current_lines.append(stripped)
+
+    if current_lines:
+        entries.append("\n".join(current_lines).strip())
+    return entries
+
+
+def _as_project_entries(section_text):
+    return [
+        {"raw_text": entry}
+        for entry in _split_project_entries(section_text)
+        if entry
+    ]
+
+
 # ============================================================
 # 3b. EXPERIENCE: SPLITTING ONE BLOCK INTO SEVERAL ENTRIES
 # ============================================================
@@ -2093,6 +2154,8 @@ def parse_resume(resume_text):
             # Experience alone gets the extra line-by-line boundary pass
             # (see section 3b); every other list section is unchanged.
             result[key] = _as_experience_entries(combined_text)
+        elif key == "projects":
+            result[key] = _as_project_entries(combined_text)
         elif key in _LIST_SECTION_KEYS:
             result[key] = _as_raw_text_entries(combined_text)
         elif key == "skills":

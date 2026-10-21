@@ -1,0 +1,193 @@
+{
+  "cases": [
+    {
+      "id": "identity_name",
+      "category": "identity",
+      "question": "What is the candidate's name?",
+      "expected_behavior": "answer",
+      "requires_live_llm": false,
+      "assertions": {"must_contain_all": ["Alex Rivera"]}
+    },
+    {
+      "id": "education_university",
+      "category": "education",
+      "question": "What university did the candidate attend?",
+      "expected_behavior": "answer",
+      "assertions": {"must_contain_all": ["Example University"]}
+    },
+    {
+      "id": "attended_university",
+      "category": "education",
+      "question": "Did the candidate attend Example University?",
+      "expected_behavior": "answer",
+      "assertions": {"must_contain_all": ["Example University"]}
+    },
+    {
+      "id": "degree",
+      "category": "education",
+      "question": "What degree did the candidate earn?",
+      "expected_behavior": "answer",
+      "assertions": {"must_contain_all": ["Bachelor of Science in Information Systems"]}
+    },
+    {
+      "id": "employer_name",
+      "category": "experience",
+      "question": "What company did the candidate work for?",
+      "expected_behavior": "answer",
+      "assertions": {"must_contain_all": ["Example Corporation"]}
+    },
+    {
+      "id": "worked_at_employer",
+      "category": "experience",
+      "question": "Did the candidate work at Example Corporation?",
+      "expected_behavior": "answer",
+      "assertions": {"must_contain_all": ["Example Corporation"]}
+    },
+    {
+      "id": "experience_responsibilities",
+      "category": "responsibilities",
+      "question": "What were the candidate's responsibilities at Example Corporation?",
+      "expected_behavior": "answer",
+      "assertions": {"must_contain_any": ["web applications", "database records", "technical support", "internal documentation"]}
+    },
+    {
+      "id": "general_technologies",
+      "category": "skills",
+      "question": "What technologies does the candidate know?",
+      "expected_behavior": "answer",
+      "assertions": {"must_contain_any": ["Python", "JavaScript", "GlobalSkillFramework", "PostgreSQL"]}
+    },
+    {
+      "id": "programming_languages",
+      "category": "skills",
+      "question": "What programming languages are listed in the candidate's skills?",
+      "expected_behavior": "answer",
+      "assertions": {"must_contain_all": ["Python", "JavaScript"]}
+    },
+    {
+      "id": "python_mentioned",
+      "category": "skills",
+      "question": "Did the candidate use Python?",
+      "expected_behavior": "answer",
+      "assertions": {"must_contain_all": ["Python"]}
+    },
+    {
+      "id": "database_in_skills",
+      "category": "skills",
+      "question": "What database is listed in the candidate's skills?",
+      "expected_behavior": "answer",
+      "assertions": {"must_contain_all": ["PostgreSQL"]}
+    },
+    {
+      "id": "capstone_technologies",
+      "category": "project technology relationship",
+      "question": "What technologies did the candidate use in the capstone project?",
+      "expected_behavior": "answer",
+      "assertions": {
+        "must_contain_any": ["CapstoneFramework", "Python"],
+        "must_contain_any_context": ["Example Delivery Platform", "capstone"],
+        "must_not_attribute_to_project": [
+          {"technology": "GlobalSkillFramework", "project": ["capstone", "Example Delivery Platform"]}
+        ]
+      }
+    },
+    {
+      "id": "capstone_framework_relationship",
+      "category": "project technology relationship",
+      "question": "Did the candidate use CapstoneFramework in the capstone project?",
+      "expected_behavior": "answer",
+      "assertions": {
+        "must_contain_all": ["CapstoneFramework"],
+        "must_contain_any_context": ["Example Delivery Platform", "capstone"]
+      }
+    },
+    {
+      "id": "skills_only_framework_capstone",
+      "category": "project technology relationship",
+      "question": "Did the candidate use GlobalSkillFramework in the capstone project?",
+      "expected_behavior": "relationship_not_established",
+      "relationship_check": {
+        "kind": "technology_project",
+        "technology": "GlobalSkillFramework",
+        "project": ["capstone", "Example Delivery Platform"]
+      }
+    },
+    {
+      "id": "inventory_framework",
+      "category": "project",
+      "question": "What framework was used in the Example Inventory Tool?",
+      "expected_behavior": "answer",
+      "assertions": {
+        "must_contain_all": ["OtherProjectFramework"],
+        "must_contain_any_context": ["Example Inventory Tool", "inventory tool"]
+      }
+    },
+    {
+      "id": "other_project_framework_not_capstone",
+      "category": "project technology relationship",
+      "question": "Was OtherProjectFramework used in the capstone project?",
+      "expected_behavior": "relationship_not_established",
+      "relationship_check": {
+        "kind": "technology_project",
+        "technology": "OtherProjectFramework",
+        "project": ["capstone", "Example Delivery Platform"]
+      }
+    },
+    {
+      "id": "skills_only_database_capstone",
+      "category": "project technology relationship",
+      "question": "Did the candidate use PostgreSQL in the capstone project?",
+      "expected_behavior": "relationship_not_established",
+      "relationship_check": {
+        "kind": "technology_project",
+        "technology": "PostgreSQL",
+        "project": ["capstone", "Example Delivery Platform"]
+      }
+    },
+    {
+      "id": "favorite_language",
+      "category": "unsupported claims",
+      "question": "What is the candidate's favorite programming language?",
+      "expected_behavior": "refuse",
+      "assertions": {"must_not_claim_favorite": true}
+    },
+    {
+      "id": "absent_employer_nasa",
+      "category": "unsupported claims",
+      "question": "Did the candidate work at NASA?",
+      "expected_behavior": "refuse",
+      "assertions": {"must_not_claim_employer": ["NASA"]}
+    },
+    {
+      "id": "salary_absent",
+      "category": "unsupported claims",
+      "question": "What is the candidate's salary?",
+      "expected_behavior": "refuse",
+      "assertions": {"must_not_claim_salary": true}
+    },
+    {
+      "id": "unspecified_personal_fact",
+      "category": "unsupported claims",
+      "question": "Tell me something about the candidate that is not in the resume.",
+      "expected_behavior": "refuse",
+      "assertions": {}
+    },
+    {
+      "id": "university_not_employer",
+      "category": "employer/project distinction",
+      "question": "Did the candidate work for Example University?",
+      "expected_behavior": "refuse",
+      "assertions": {"must_not_claim_employer": ["Example University"]}
+    },
+    {
+      "id": "project_not_employer",
+      "category": "employer/project distinction",
+      "question": "Was Example Delivery Platform the candidate's employer?",
+      "expected_behavior": "relationship_not_established",
+      "relationship_check": {
+        "kind": "entity_employer",
+        "entity": "Example Delivery Platform"
+      }
+    }
+  ]
+}
