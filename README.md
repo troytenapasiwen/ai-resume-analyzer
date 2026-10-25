@@ -1,5 +1,19 @@
 # AI Resume Analyzer
 
+The repository includes a hosted portfolio preview and a separate fully local application.
+
+## Hosted portfolio preview
+
+- Entry point: `app_portfolio.py`
+- Intended for demonstrating the interface and layout.
+- Resume upload and question controls are disabled in this preview.
+- It does not provide live AI analysis because the local FastAPI and Ollama backend are not hosted with it.
+- For a Streamlit Community Cloud deployment, select `app_portfolio.py` as the main file and `requirements-portfolio.txt` as the dependency file.
+
+## Full local application
+
+Run `app.py` with the FastAPI backend and local Ollama model to use the working resume-analysis flow. Follow the local setup instructions below.
+
 This project is a local, single-user resume analyzer built around a FastAPI backend, a Streamlit frontend, a PyMuPDF-based PDF extractor, and a local Ollama model call for the reasoning loop.
 
 ## Runtime architecture
